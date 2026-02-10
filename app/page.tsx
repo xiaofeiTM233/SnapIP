@@ -1,7 +1,7 @@
 // app/page.tsx
 'use client';
 import { useState, useEffect } from 'react';
-import { Layout, Table, Input, Button, Form, Tag, Select, message, Card, Modal, Space } from 'antd';
+import { Layout, Table, Input, Button, Form, Tag, Select, message, Card, Modal, Space, Alert } from 'antd';
 import { SearchOutlined, PlusOutlined, DeleteOutlined, ReloadOutlined, UploadOutlined, DownloadOutlined } from '@ant-design/icons';
 
 const { Header, Content } = Layout;
@@ -30,12 +30,14 @@ export default function Home() {
   const [filterIp, setFilterIp] = useState<string>('');
   const [mounted, setMounted] = useState(false);
   const [conflictedEntries, setConflictedEntries] = useState<ConflictedEntry[]>([]);
+  const [containingEntries, setContainingEntries] = useState<ConflictedEntry[]>([]);
   const [pendingSubmitData, setPendingSubmitData] = useState<any>(null);
   const [labelOptions, setLabelOptions] = useState<string[]>(['A', 'B', 'C']); // 存储所有可用的组
   const [selectedLabel, setSelectedLabel] = useState<string>('A'); // 当前选择的组
   const [batchImportModalOpen, setBatchImportModalOpen] = useState(false); // 批量导入模态框
   const [batchImportText, setBatchImportText] = useState<string>(''); // 批量导入文本
   const [batchImportLabel, setBatchImportLabel] = useState<string>('A'); // 批量导入的组
+  const [batchImportNote, setBatchImportNote] = useState<string>(''); // 批量导入的备注
   const [batchImportResults, setBatchImportResults] = useState<any[]>([]); // 批量导入结果
   const [exportFormat, setExportFormat] = useState<'line' | 'csv'>('line'); // 导出格式：line(一行一个) 或 csv(逗号分隔)
 
@@ -129,10 +131,14 @@ export default function Home() {
         form.setFieldsValue({ label: [labelValue] }); // 保持当前选择的组，使用数组格式
         form.setFieldsValue({ cidr: '' }); // 只清空cidr，保留label和note供下一次使用
         fetchIps(filterLabel, filterIp); // 刷新列表
-      } else if (res.status === 409) {
+      } else       if (res.status === 409) {
         if (json.conflictType === 'contains_existing') {
-          // 显示覆盖确认对话框
+          // 显示覆盖确认对话框（新IP包含小网段）
           setConflictedEntries(json.conflictedEntries);
+          setPendingSubmitData({ ...values, label: labelValue });
+        } else if (json.conflictType === 'contained') {
+          // 显示包含确认对话框（新IP被大网段包含）
+          setContainingEntries(json.containingEntries);
           setPendingSubmitData({ ...values, label: labelValue });
         } else {
           // 其他冲突直接显示错误
@@ -184,6 +190,7 @@ export default function Home() {
   // 取消覆盖
   const handleCancelOverwrite = () => {
     setConflictedEntries([]);
+    setContainingEntries([]);
     setPendingSubmitData(null);
   };
 
@@ -275,14 +282,17 @@ export default function Home() {
       return;
     }
 
+    // 对数据进行排序：按CIDR字符串排序
+    const sortedData = [...data].sort((a, b) => a.cidr.localeCompare(b.cidr));
+
     let content = '';
 
     if (exportFormat === 'line') {
       // 一行一个格式，只导出IP段
-      content = data.map(item => item.cidr).join('\n');
+      content = sortedData.map(item => item.cidr).join('\n');
     } else {
       // 逗号分隔格式，只导出IP段
-      content = data.map(item => item.cidr).join(',');
+      content = sortedData.map(item => item.cidr).join(',');
     }
 
     // 创建Blob并下载
@@ -312,6 +322,7 @@ export default function Home() {
   const handleOpenBatchImport = () => {
     setBatchImportText('');
     setBatchImportLabel(selectedLabel);
+    setBatchImportNote('');
     setBatchImportResults([]);
     setBatchImportModalOpen(true);
   };
@@ -350,38 +361,22 @@ export default function Home() {
         continue;
       }
 
-      // 预检查冲突
+        // 预检查冲突
       try {
         const res = await fetch('/api/ips', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cidr, label: batchImportLabel, _checkOnly: true }),
+          body: JSON.stringify({ cidr, label: batchImportLabel, note: batchImportNote, _checkOnly: true }),
         });
         const json = await res.json();
 
-        if (json.conflictType === 'contains_existing') {
-          results.push({
-            original: trimmedLine,
-            cidr: cidr,
-            success: false,
-            status: 'conflict',
-            error: '冲突',
-            conflictData: json.conflictedEntries,
-          });
-        } else if (json.conflictType === 'contained') {
-          results.push({
-            original: trimmedLine,
-            cidr: cidr,
-            success: false,
-            status: 'error',
-            error: '被包含',
-          });
-        } else {
+        // 检查返回结果
+        if (json.success && json.conflictType === null) {
           // 无冲突，直接导入
           const importRes = await fetch('/api/ips', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cidr, label: batchImportLabel }),
+            body: JSON.stringify({ cidr, label: batchImportLabel, note: batchImportNote }),
           });
           const importJson = await importRes.json();
 
@@ -402,6 +397,43 @@ export default function Home() {
               error: importJson.message || '添加失败',
             });
           }
+        } else if (json.conflictType === 'contains_existing') {
+          results.push({
+            original: trimmedLine,
+            cidr: cidr,
+            success: false,
+            status: 'conflict',
+            error: '冲突',
+            conflictedEntries: json.conflictedEntries,
+          });
+        } else if (json.conflictType === 'contained') {
+          // 被包含也归为跳过
+          results.push({
+            original: trimmedLine,
+            cidr: cidr,
+            success: false,
+            status: 'skipped',
+            error: '重复',
+            containingEntries: json.containingEntries,
+          });
+        } else if (json.conflictType === 'duplicate') {
+          // 完全相同，归为跳过
+          results.push({
+            original: trimmedLine,
+            cidr: cidr,
+            success: false,
+            status: 'skipped',
+            error: '重复',
+          });
+        } else {
+          // 未知错误
+          results.push({
+            original: trimmedLine,
+            cidr: cidr,
+            success: false,
+            status: 'error',
+            error: json.message || '检查失败',
+          });
         }
       } catch (error) {
         results.push({
@@ -417,20 +449,16 @@ export default function Home() {
     setLoading(false);
     setBatchImportResults(results);
 
-    const successCount = results.filter(r => r.success).length;
-    const conflictCount = results.filter(r => r.status === 'conflict').length;
+    const successCount = results.filter(r => r.status === 'success').length;
     const errorCount = results.filter(r => r.status === 'error').length;
+    const skippedCount = results.filter(r => r.status === 'skipped').length;
+    const conflictCount = results.filter(r => r.status === 'conflict').length;
+    const containedCount = results.filter(r => r.status === 'contained').length;
 
-    if (errorCount === 0 && conflictCount === 0) {
-      message.success(`批量导入成功！共导入 ${successCount} 个IP段`);
-      setTimeout(() => {
-        setBatchImportModalOpen(false);
-        fetchIps(filterLabel, filterIp);
-      }, 1500);
-    } else if (conflictCount === 0 && errorCount > 0) {
-      message.error(`批量导入失败！共 ${errorCount} 个IP段导入失败`);
+    if (errorCount === 0 && conflictCount === 0 && containedCount === 0) {
+      message.success(`批量导入成功！成功 ${successCount} 个，跳过 ${skippedCount} 个`);
     } else {
-      message.warning(`批量导入部分完成！成功 ${successCount} 个，冲突 ${conflictCount} 个，错误 ${errorCount} 个`);
+      message.warning(`批量导入部分完成！成功 ${successCount} 个，错误 ${errorCount} 个，跳过 ${skippedCount} 个`);
     }
 
     // 更新组选项
@@ -469,16 +497,6 @@ export default function Home() {
         };
         setBatchImportResults(newResults);
         message.success('覆盖成功');
-        
-        // 检查是否全部完成
-        const remainingConflict = newResults.filter(r => r.status === 'conflict').length;
-        const remainingError = newResults.filter(r => r.status === 'error').length;
-        if (remainingConflict === 0 && remainingError === 0) {
-          setTimeout(() => {
-            setBatchImportModalOpen(false);
-            fetchIps(filterLabel, filterIp);
-          }, 1500);
-        }
       } else {
         const newResults = [...batchImportResults];
         newResults[index] = {
@@ -512,19 +530,6 @@ export default function Home() {
       error: '已跳过',
     };
     setBatchImportResults(newResults);
-    
-    // 检查是否全部完成
-    const remainingConflict = newResults.filter(r => r.status === 'conflict').length;
-    const remainingError = newResults.filter(r => r.status === 'error').length;
-    if (remainingConflict === 0 && remainingError === 0) {
-      const successCount = newResults.filter(r => r.success).length;
-      const skippedCount = newResults.filter(r => r.status === 'skipped').length;
-      message.success(`批量导入完成！成功 ${successCount} 个，跳过 ${skippedCount} 个`);
-      setTimeout(() => {
-        setBatchImportModalOpen(false);
-        fetchIps(filterLabel, filterIp);
-      }, 1500);
-    }
   };
 
   // 表格列定义
@@ -624,6 +629,12 @@ export default function Home() {
               </Form.Item>
             </div>
           </Form>
+          <Alert
+            title="自动补全示例：输入 47.82 → 47.82.0.0/16；输入 2001:db8 → 2001:db8::/32"
+            type="info"
+            showIcon
+            style={{ marginTop: 12 }}
+          />
         </Card>
 
         {/* 列表区域 */}
@@ -708,6 +719,34 @@ export default function Home() {
         </p>
       </Modal>
 
+      {/* 被包含确认对话框 */}
+      <Modal
+        title="IP 段已被包含"
+        open={containingEntries.length > 0}
+        onOk={handleCancelOverwrite}
+        onCancel={handleCancelOverwrite}
+        okText="确定"
+        cancelText="取消"
+        width={600}
+      >
+        <p style={{ marginBottom: 16 }}>
+          新的 IP 段已被以下 <strong>{containingEntries.length}</strong> 个网段包含，无法导入：
+        </p>
+        <div style={{ maxHeight: '300px', overflowY: 'auto', background: '#f5f5f5', padding: '12px', borderRadius: '4px' }}>
+          {containingEntries.map((entry) => (
+            <div key={entry.id} style={{ marginBottom: '8px', paddingBottom: '8px', borderBottom: '1px solid #e0e0e0' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <Tag color={entry.label === 'A' ? 'blue' : entry.label === 'B' ? 'green' : 'default'}>
+                  {entry.label}
+                </Tag>
+                <b style={{ fontFamily: 'monospace' }}>{entry.cidr}</b>
+              </div>
+              {entry.note && <div style={{ fontSize: '12px', color: '#666', marginTop: '4px', marginLeft: '32px' }}>{entry.note}</div>}
+            </div>
+          ))}
+        </div>
+      </Modal>
+
       {/* 批量导入模态框 */}
       <Modal
         title="批量导入IP段"
@@ -739,7 +778,16 @@ export default function Home() {
             placeholder="选择分组"
           />
         </div>
-        
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: 'block', marginBottom: 8, fontWeight: 500 }}>备注（可选）：</label>
+          <Input
+            placeholder="为所有导入的IP段添加备注"
+            value={batchImportNote}
+            onChange={(e) => setBatchImportNote(e.target.value)}
+          />
+        </div>
+
         <div style={{ marginBottom: 16 }}>
           <label style={{ display: 'block', marginBottom: 8, fontWeight: 500 }}>IP段列表（一行一个）：</label>
           <TextArea
@@ -749,9 +797,6 @@ export default function Home() {
             onChange={(e) => setBatchImportText(e.target.value)}
             style={{ fontFamily: 'monospace' }}
           />
-          <div style={{ marginTop: 8, fontSize: '12px', color: '#666' }}>
-            💡 支持自动补全：\n• IPv4：2段→/16，3段→/24，4段→/32\n• IPv6：输入2001:db8:自动补全为2001:db8::/64
-          </div>
         </div>
 
         {batchImportResults.length > 0 && (
@@ -759,17 +804,16 @@ export default function Home() {
             <div style={{ marginBottom: 16, fontSize: '13px' }}>
               <p style={{ marginBottom: 8 }}>💡 导入结果：</p>
               <p style={{ color: '#52c41a', marginBottom: 8 }}>• <strong>✓ 成功</strong>：{batchImportResults.filter(r => r.status === 'success').length} 个</p>
-              <p style={{ color: '#ff4d4f', marginBottom: 8 }}>• <strong>⚠ 冲突</strong>：{batchImportResults.filter(r => r.status === 'conflict').length} 个（可逐个处理）</p>
               <p style={{ color: '#ff4d4f', marginBottom: 8 }}>• <strong>✗ 错误</strong>：{batchImportResults.filter(r => r.status === 'error').length} 个</p>
               <p style={{ color: '#999', marginBottom: 8 }}>• <strong>⊘ 跳过</strong>：{batchImportResults.filter(r => r.status === 'skipped').length} 个</p>
             </div>
             <div style={{ maxHeight: '300px', overflowY: 'auto', background: '#f5f5f5', padding: '12px', borderRadius: '4px' }}>
               {batchImportResults.map((result, index) => (
-                <div 
-                  key={index} 
-                  style={{ 
-                    marginBottom: '12px', 
-                    paddingBottom: '12px', 
+                <div
+                  key={index}
+                  style={{
+                    marginBottom: '12px',
+                    paddingBottom: '12px',
                     borderBottom: '1px solid #e0e0e0',
                     display: 'flex',
                     flexDirection: 'column',
@@ -777,7 +821,7 @@ export default function Home() {
                   }}
                 >
                   <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                    <span style={{ 
+                    <span style={{
                       color: result.status === 'success' ? '#52c41a' : result.status === 'conflict' ? '#faad14' : result.status === 'skipped' ? '#999' : '#ff4d4f',
                       fontWeight: 'bold',
                       minWidth: '24px',
@@ -790,33 +834,48 @@ export default function Home() {
                         {result.original} {result.cidr !== result.original && <span style={{ color: '#1890ff' }}>→ {result.cidr}</span>}
                       </div>
                       {result.error && result.status !== 'success' && (
-                        <div style={{ fontSize: '12px', color: '#ff4d4f' }}>{result.error}</div>
+                        <div style={{ fontSize: '12px', color: result.status === 'skipped' ? '#999' : '#ff4d4f' }}>
+                          {result.error}
+                          {result.status === 'conflict' && (
+                            <span style={{ color: '#faad14', marginLeft: '4px' }}>(冲突)</span>
+                          )}
+                        </div>
                       )}
-                      {result.conflictData && result.status === 'conflict' && (
+                      {result.conflictedEntries && result.status === 'conflict' && (
                         <div style={{ fontSize: '11px', color: '#faad14', marginTop: '4px' }}>
-                          将覆盖：{result.conflictData.map((c: any, i: number) => (
+                          被：{result.conflictedEntries.map((c: any, i: number) => (
                             <span key={c.id}>
                               {i > 0 && ', '}
                               <b>{c.cidr}</b> (组{c.label})
                             </span>
-                          ))}
+                          ))} 包含
+                        </div>
+                      )}
+                      {result.containingEntries && result.status === 'skipped' && result.error === '重复' && (
+                        <div style={{ fontSize: '11px', color: '#722ed1', marginTop: '4px' }}>
+                          被：{result.containingEntries.map((c: any, i: number) => (
+                            <span key={c.id}>
+                              {i > 0 && ', '}
+                              <b>{c.cidr}</b> (组{c.label})
+                            </span>
+                          ))} 包含
                         </div>
                       )}
                     </div>
                   </div>
                   {result.status === 'conflict' && (
                     <div style={{ display: 'flex', gap: '8px', marginLeft: '32px' }}>
-                      <Button 
-                        size="small" 
-                        type="primary" 
+                      <Button
+                        size="small"
+                        type="primary"
                         danger
                         onClick={() => handleSingleOverwrite(index)}
                         loading={loading}
                       >
                         覆盖
                       </Button>
-                      <Button 
-                        size="small" 
+                      <Button
+                        size="small"
                         onClick={() => handleSingleSkip(index)}
                       >
                         跳过

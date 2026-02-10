@@ -25,27 +25,40 @@ export async function GET(request: Request) {
   const label = searchParams.get('label');
   const ip = searchParams.get('ip');
 
-  // 如果提供了IP参数，查询包含该IP的所有网段
+  // 如果提供了IP参数，查询包含该IP的所有网段或前缀匹配的网段
   if (ip) {
     try {
-      const queryIp = parseAddress(ip);
-      if (!queryIp) {
-        return NextResponse.json({ success: false, message: '无效的 IP 地址格式' }, { status: 400 });
-      }
-      
       const allEntries = await IpEntry.find({}).sort({ createdAt: -1 });
+      const queryText = ip.trim().toLowerCase();
+
+      // 尝试作为完整IP地址查询（包含关系）
+      const queryIp = parseAddress(ip);
+
       const matchedEntries = allEntries.filter(entry => {
         try {
-          const entryIp = parseAddress(entry.cidr);
-          if (!entryIp) return false;
-          return queryIp.isInSubnet(entryIp);
+          const entryCidr = entry.cidr.toLowerCase();
+
+          // 1. 前缀匹配：检查网段CIDR是否以查询文本开头
+          if (entryCidr.startsWith(queryText)) {
+            return true;
+          }
+
+          // 2. 如果查询的IP可以被解析，检查是否在该网段内
+          if (queryIp) {
+            const entryIp = parseAddress(entry.cidr);
+            if (entryIp) {
+              return queryIp.isInSubnet(entryIp);
+            }
+          }
+
+          return false;
         } catch (e) {
           return false;
         }
       });
       return NextResponse.json({ success: true, data: matchedEntries });
     } catch (e) {
-      return NextResponse.json({ success: false, message: '无效的 IP 地址格式' }, { status: 400 });
+      return NextResponse.json({ success: false, message: '查询失败' }, { status: 500 });
     }
   }
 
@@ -76,6 +89,8 @@ export async function POST(request: Request) {
 
   // 收集被包含的小IP段（用于覆盖）
   const conflictedEntries: any[] = [];
+  // 收集包含新IP的大IP段
+  const containingEntries: any[] = [];
 
   for (const entry of allEntries) {
     try {
@@ -84,11 +99,7 @@ export async function POST(request: Request) {
 
       // 场景 1: 新加入的 (110.249.1.0/24) 已经被现有的 (110.249.0.0/16) 包含
       if (newIp.isInSubnet(existingIp)) {
-        return NextResponse.json({
-          success: false,
-          conflictType: 'contained',
-          message: `拒绝添加！该 IP 段包含在已存在的 [组 ${entry.label}] ${entry.cidr} 中。`
-        }, { status: 409 });
+        containingEntries.push(entry);
       }
 
       // 场景 2: 新加入的 (110.249.0.0/16) 包含了现有的 (110.249.1.0/24)
@@ -99,6 +110,36 @@ export async function POST(request: Request) {
     } catch (e) {
       continue; // 忽略脏数据
     }
+  }
+
+  // 如果新IP被现有的大IP段包含
+  if (containingEntries.length > 0) {
+    // 如果是检查模式，只返回包含信息
+    if (_checkOnly === true) {
+      return NextResponse.json({
+        success: false,
+        conflictType: 'contained',
+        message: `该 IP 段已被以下 ${containingEntries.length} 个网段包含：`,
+        containingEntries: containingEntries.map(e => ({
+          id: e._id,
+          cidr: e.cidr,
+          label: e.label,
+          note: e.note
+        }))
+      }, { status: 200 });
+    }
+
+    return NextResponse.json({
+      success: false,
+      conflictType: 'contained',
+      message: `该 IP 段已被以下 ${containingEntries.length} 个网段包含：`,
+      containingEntries: containingEntries.map(e => ({
+        id: e._id,
+        cidr: e.cidr,
+        label: e.label,
+        note: e.note
+      }))
+    }, { status: 409 });
   }
 
   // 如果存在会被包含的小IP段
@@ -143,6 +184,34 @@ export async function POST(request: Request) {
 
   // 3. 无冲突，保存
   try {
+    // 检查是否完全重复（包括label）
+    const exactDuplicate = allEntries.find(entry => {
+      try {
+        const existingIp = parseAddress(entry.cidr);
+        if (!existingIp) return false;
+        // 检查CIDR是否相同
+        const sameCidr = existingIp.startAddress().address === newIp.startAddress().address &&
+                        existingIp.endAddress().address === newIp.endAddress().address;
+        // 检查label是否相同
+        const sameLabel = entry.label === label;
+        return sameCidr && sameLabel;
+      } catch (e) {
+        return false;
+      }
+    });
+
+    if (exactDuplicate) {
+      // 完全重复，返回duplicate类型
+      if (_checkOnly === true) {
+        return NextResponse.json({
+          success: false,
+          conflictType: 'duplicate',
+          message: '该 IP 段已完全重复存在'
+        }, { status: 200 });
+      }
+      return NextResponse.json({ success: false, message: '该 IP 段已完全重复存在' }, { status: 409 });
+    }
+
     // 如果是检查模式，只返回成功信息
     if (_checkOnly === true) {
       return NextResponse.json({
