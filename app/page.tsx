@@ -40,6 +40,7 @@ export default function Home() {
   const [batchImportNote, setBatchImportNote] = useState<string>(''); // 批量导入的备注
   const [batchImportResults, setBatchImportResults] = useState<any[]>([]); // 批量导入结果
   const [exportFormat, setExportFormat] = useState<'line' | 'csv'>('line'); // 导出格式：line(一行一个) 或 csv(逗号分隔)
+  const [pageSize, setPageSize] = useState(10); // 每页条数
 
   // 获取数据
   const fetchIps = async (label = '', ip = '') => {
@@ -256,9 +257,21 @@ export default function Home() {
     return null;
   };
 
-  // IP 自动补全
+  // IP 自动补全（失焦时）
   const handleCidrBlur = (e: React.FocusEvent<HTMLInputElement>) => {
     const value = e.target.value.trim();
+    if (!value) return;
+
+    const completed = autoCompleteCidr(value);
+    if (completed && completed !== value) {
+      form.setFieldValue('cidr', completed);
+      message.success(`已自动补全为: ${completed}`);
+    }
+  };
+
+  // IP 自动补全（回车时）
+  const handleCidrPressEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    const value = (e.target as HTMLInputElement).value.trim();
     if (!value) return;
 
     const completed = autoCompleteCidr(value);
@@ -551,6 +564,7 @@ export default function Home() {
                   placeholder="例如: 47.82.123 (IPv4) 或 2001:db8: (IPv6)"
                   allowClear
                   onBlur={handleCidrBlur}
+                  onPressEnter={handleCidrPressEnter}
                 />
               </Form.Item>
               <Form.Item
@@ -627,7 +641,12 @@ export default function Home() {
             rowKey="_id"
             loading={loading}
             size="small"
-            pagination={{ pageSize: 10 }}
+            pagination={{
+              pageSize,
+              showSizeChanger: true,
+              pageSizeOptions: ['10', '20', '50', '100'],
+              onShowSizeChange: (_, size) => setPageSize(size),
+            }}
           />
         </Card>
 
