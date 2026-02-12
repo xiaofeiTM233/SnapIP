@@ -340,131 +340,69 @@ export default function Home() {
     }
 
     setLoading(true);
-    // 解析输入的IP段
-    const lines = batchImportText.split('\n').filter(line => line.trim());
-    const results: any[] = [];
 
-    for (const line of lines) {
-      const trimmedLine = line.trim();
-      if (!trimmedLine) continue;
+    try {
+      // 解析输入的IP段
+      const lines = batchImportText.split('\n').filter(line => line.trim());
+      const items: any[] = [];
 
-      // 自动补全CIDR
-      const cidr = autoCompleteCidr(trimmedLine);
-      if (!cidr) {
-        results.push({
-          original: trimmedLine,
-          cidr: null,
-          success: false,
-          status: 'error',
-          error: '无效的IP格式',
-        });
-        continue;
-      }
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine) continue;
 
-        // 预检查冲突
-      try {
-        const res = await fetch('/api/ips', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cidr, label: batchImportLabel, note: batchImportNote, _checkOnly: true }),
-        });
-        const json = await res.json();
-
-        // 检查返回结果
-        if (json.success && json.conflictType === null) {
-          // 无冲突，直接导入
-          const importRes = await fetch('/api/ips', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cidr, label: batchImportLabel, note: batchImportNote }),
-          });
-          const importJson = await importRes.json();
-
-          if (importRes.status === 200 && importJson.success) {
-            results.push({
-              original: trimmedLine,
-              cidr: cidr,
-              success: true,
-              status: 'success',
-              error: null,
-            });
-          } else {
-            results.push({
-              original: trimmedLine,
-              cidr: cidr,
-              success: false,
-              status: 'error',
-              error: importJson.message || '添加失败',
-            });
-          }
-        } else if (json.conflictType === 'contains_existing') {
-          results.push({
+        // 自动补全CIDR
+        const cidr = autoCompleteCidr(trimmedLine);
+        if (!cidr) {
+          items.push({
             original: trimmedLine,
-            cidr: cidr,
-            success: false,
-            status: 'conflict',
-            error: '冲突',
-            conflictedEntries: json.conflictedEntries,
-          });
-        } else if (json.conflictType === 'contained') {
-          // 被包含也归为跳过
-          results.push({
-            original: trimmedLine,
-            cidr: cidr,
-            success: false,
-            status: 'skipped',
-            error: '重复',
-            containingEntries: json.containingEntries,
-          });
-        } else if (json.conflictType === 'duplicate') {
-          // 完全相同，归为跳过
-          results.push({
-            original: trimmedLine,
-            cidr: cidr,
-            success: false,
-            status: 'skipped',
-            error: '重复',
+            cidr: null,
+            error: '无效的IP格式',
           });
         } else {
-          // 未知错误
-          results.push({
+          items.push({
             original: trimmedLine,
-            cidr: cidr,
-            success: false,
-            status: 'error',
-            error: json.message || '检查失败',
+            cidr,
+            label: batchImportLabel,
+            note: batchImportNote,
           });
         }
-      } catch (error) {
-        results.push({
-          original: trimmedLine,
-          cidr: cidr,
-          success: false,
-          status: 'error',
-          error: '检查失败',
-        });
       }
-    }
 
-    setLoading(false);
-    setBatchImportResults(results);
+      // 调用批量导入API
+      const res = await fetch('/api/ips/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items }),
+      });
+      const json = await res.json();
 
-    const successCount = results.filter(r => r.status === 'success').length;
-    const errorCount = results.filter(r => r.status === 'error').length;
-    const skippedCount = results.filter(r => r.status === 'skipped').length;
-    const conflictCount = results.filter(r => r.status === 'conflict').length;
-    const containedCount = results.filter(r => r.status === 'contained').length;
+      setLoading(false);
 
-    if (errorCount === 0 && conflictCount === 0 && containedCount === 0) {
-      message.success(`批量导入成功！成功 ${successCount} 个，跳过 ${skippedCount} 个`);
-    } else {
-      message.warning(`批量导入部分完成！成功 ${successCount} 个，错误 ${errorCount} 个，跳过 ${skippedCount} 个`);
-    }
+      if (json.success) {
+        setBatchImportResults(json.results);
 
-    // 更新组选项
-    if (!labelOptions.includes(batchImportLabel)) {
-      const newOptions = [...labelOptions, batchImportLabel];
-      setLabelOptions(newOptions);
+        const successCount = json.results.filter((r: any) => r.status === 'success').length;
+        const errorCount = json.results.filter((r: any) => r.status === 'error').length;
+        const skippedCount = json.results.filter((r: any) => r.status === 'skipped').length;
+        const conflictCount = json.results.filter((r: any) => r.status === 'conflict').length;
+
+        if (errorCount === 0 && conflictCount === 0) {
+          message.success(`批量导入成功！成功 ${successCount} 个，跳过 ${skippedCount} 个`);
+        } else {
+          message.warning(`批量导入部分完成！成功 ${successCount} 个，错误 ${errorCount} 个，跳过 ${skippedCount} 个`);
+        }
+
+        // 更新组选项
+        if (!labelOptions.includes(batchImportLabel)) {
+          const newOptions = [...labelOptions, batchImportLabel];
+          setLabelOptions(newOptions);
+        }
+      } else {
+        message.error(json.message || '批量导入失败');
+      }
+    } catch (error) {
+      setLoading(false);
+      message.error('网络请求错误');
     }
   };
 
@@ -475,28 +413,36 @@ export default function Home() {
 
     setLoading(true);
     try {
-      const res = await fetch('/api/ips', {
+      // 使用批量导入API处理覆盖
+      const res = await fetch('/api/ips/batch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          cidr: entry.cidr, 
-          label: batchImportLabel,
-          overwrite: true 
+        body: JSON.stringify({
+          items: [{
+            original: entry.original,
+            cidr: entry.cidr,
+            label: batchImportLabel,
+            note: batchImportNote,
+            overwrite: true
+          }]
         }),
       });
       const json = await res.json();
 
       if (res.status === 200 && json.success) {
-        // 更新结果列表
+        const result = json.results[0];
         const newResults = [...batchImportResults];
         newResults[index] = {
           ...entry,
-          success: true,
-          status: 'success',
-          error: null,
+          status: result.status,
+          error: result.error,
         };
         setBatchImportResults(newResults);
-        message.success('覆盖成功');
+        if (result.status === 'success') {
+          message.success('覆盖成功');
+        } else {
+          message.error(result.error || '覆盖失败');
+        }
       } else {
         const newResults = [...batchImportResults];
         newResults[index] = {
